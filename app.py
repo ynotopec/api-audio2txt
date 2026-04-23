@@ -1,10 +1,18 @@
 # app.py — FastAPI ASR (Whisper v3 Turbo) — ultra-ultra optimisé
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Form
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os, io, json, torch, torchaudio
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---- Perf CPU/GPU globales ----
 try:
