@@ -1,66 +1,19 @@
-#fastapi
-#uvicorn
-#torch>=2.1.0
-#torchaudio>=2.1.0
-#transformers>=4.36.0
-## Pour les modèles avec pipeline ASR
-#accelerate
-## Optionnel pour rapidité si installé : safetensors
-#safetensors
-
-
-# --- Core PyTorch + CUDA 12.1 ---
-torch
-#==2.4.1          --extra-index-url https://download.pytorch.org/whl/cu121
-torchaudio
-#==2.4.1     --extra-index-url https://download.pytorch.org/whl/cu121
-torchvision
-#==0.19.1     --extra-index-url https://download.pytorch.org/whl/cu121
-
-transformers
-#==4.44.2
-accelerate
-#==0.33.0
-sentencepiece
-#==0.2.0
-
-
-# --- TorchCodec pour décodage audio ---
-torchcodec
-#==0.1.0
-
-# --- Hugging Face ---
-#transformers==4.43.3
-safetensors>=0.4.3
-huggingface-hub>=0.23.0
-
-# --- API & Server ---
+# Core API
 fastapi
-#==0.111.0
 uvicorn[standard]
-#==0.30.1
-
-# --- Audio / Traitement ---
-soundfile
-#==0.12.1
-numpy
-#==1.26.4
-
-# --- Utilitaires ---
 python-multipart
-#==0.0.9
 
-
-# requirements-new.txt - Only NEW dependencies for optimizations
-
-# Flash Attention 2 (2-3x speedup on long audio, CUDA 11.8+ required)
-#flash-attn
-#==2.5.5
-
-# TorchCodec (fastest audio decoding, PyTorch 2.2+ required)
+# ASR / ML
+accelerate
+huggingface-hub>=0.23.0
+numpy
+safetensors>=0.4.3
+sentencepiece
+soundfile
+torch
+torchaudio
 torchcodec
-#==0.0.1
+transformers
 
-# Prometheus client (for metrics/monitoring)
+# Monitoring
 prometheus-client
-#==0.19.0

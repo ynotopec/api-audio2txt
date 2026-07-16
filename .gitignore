@@ -1,0 +1,33 @@
+# Secrets and local configuration
+.env
+auth_tokens.txt
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and runtime files
+*.log
+*.pid
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
