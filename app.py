@@ -51,6 +51,7 @@ ASR_NUM_BEAMS = int(os.getenv("ASR_NUM_BEAMS", "1"))
 ASR_WORKERS = int(os.getenv("ASR_WORKERS", "1"))
 
 AUTH_FILE = os.getenv("AUTH_FILE", "auth_tokens.txt")
+ASR_API_TOKENS = os.getenv("ASR_API_TOKENS", os.getenv("API_TOKEN", ""))
 
 
 # =============================================================================
@@ -108,11 +109,17 @@ AUTH_TOKENS = set()
 
 
 def _load_tokens(path: str = AUTH_FILE) -> set[str]:
-    if not os.path.exists(path):
-        return set()
+    tokens = {
+        token.strip()
+        for token in ASR_API_TOKENS.replace("\n", ",").split(",")
+        if token.strip()
+    }
 
-    with open(path, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            tokens.update(line.strip() for line in f if line.strip())
+
+    return tokens
 
 
 @app.on_event("startup")
@@ -123,6 +130,10 @@ def _startup() -> None:
 
 
 def _check_auth(authorization: Optional[str]) -> None:
+    if not AUTH_TOKENS:
+        log.warning("Authentication is disabled because no API tokens are configured")
+        return
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -405,6 +416,7 @@ def healthz() -> Dict[str, Any]:
 
 
 @app.post("/v1/audio/transcriptions")
+@app.post("/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
     authorization: str = Header(None),

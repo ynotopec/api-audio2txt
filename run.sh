@@ -1,48 +1,39 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Source-compatible and systemd-compatible launcher:
+#   source run.sh [IP] [PORT]
+#   ExecStart=/bin/bash -lc 'cd /path/to/api-audio2txt && source run.sh 0.0.0.0 8000'
+set -Eeuo pipefail
 
-serverAddress=$1
-portNumber=$2
+REQUESTED_HOST="${1:-}"
+REQUESTED_PORT="${2:-}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="$(basename "${PROJECT_DIR}")"
+VENV_DIR="${VENV_DIR:-${HOME}/venv/${PROJECT_NAME}}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-pythonVersion=python3
+cd "${PROJECT_DIR}"
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-pythonDir=~/"venv/$(basename "${DIR}")"
-cd $DIR
-
-deactivate 2>/dev/null
-mkdir -p "${pythonDir}"
-${pythonVersion} -m venv "${pythonDir}"
-source "${pythonDir}"/bin/activate
-
-#intall
-#${pythonVersion} -m pip cache purge ; ${pythonVersion} -m pip install -U pip setuptools wheel ; ${pythonVersion} -m pip install -U -r requirements.txt
-#optimize space
-#(jdupes -X size+:99M -r -L ~ >/dev/null 2>&1 )&
-
-export HF_HUB_DISABLE_TELEMETRY=1
-if [ ! -z "${serverAddress}" ] ;then
-  export GRADIO_SERVER_NAME="${serverAddress}"
-  export SERVER_NAME="${serverAddress}"
-fi
-if [ ! -z "${portNumber}" ] ;then
-  export GRADIO_SERVER_PORT="${portNumber}"
-  export SERVER_PORT="${portNumber}"
-  export BACK_PORT=$((SERVER_PORT + 1))
-fi
-export CUDA_LAUNCH_BLOCKING=1
-
-# Charger les variables d'environnement depuis .env
-if [ -f ".env" ]; then
-#  export $(grep -v '^#' .env | xargs)
+if [ -f .env ]; then
   set -a
+  # shellcheck disable=SC1091
   source .env
   set +a
-else
-  echo ".env file not found!"
-  exit 1
 fi
 
-#${pythonVersion} app.py $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} -m streamlit run app.py --browser.gatherUsageStats false $([ ! -z "${serverAddress}" ] && echo --server.address ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --server.port ${portNumber})
-${pythonVersion} -m uvicorn app:app $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} back.py
+if [ ! -x "${VENV_DIR}/bin/python" ]; then
+  "${PROJECT_DIR}/install.sh"
+fi
+
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+
+export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+export NVIDIA_TF32_OVERRIDE="${NVIDIA_TF32_OVERRIDE:-1}"
+
+HOST="${REQUESTED_HOST:-${HOST:-0.0.0.0}}"
+PORT="${REQUESTED_PORT:-${PORT:-8000}}"
+export HOST PORT
+
+exec python -m uvicorn app:app --host "${HOST}" --port "${PORT}"
