@@ -41,14 +41,18 @@ CHUNK = int(os.getenv("ASR_CHUNK_S", "30"))
 BATCH = int(os.getenv("ASR_BATCH", "1"))
 
 MAX_SEC = int(os.getenv("ASR_MAX_SEC", "5400"))  # 90 min max
+MAX_UPLOAD_BYTES = int(os.getenv("ASR_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 ASR_TIMEOUT = int(os.getenv("ASR_TIMEOUT", "180"))
 ASR_MAX_NEW_TOKENS = int(os.getenv("ASR_MAX_NEW_TOKENS", "256"))
+ASR_STRIDE = int(os.getenv("ASR_STRIDE_S", "5"))
 
 # Très important pour éviter des comportements de génération lents/bloqués.
 ASR_NUM_BEAMS = int(os.getenv("ASR_NUM_BEAMS", "1"))
 
 # Une seule inférence GPU à la fois par process.
-ASR_WORKERS = int(os.getenv("ASR_WORKERS", "1"))
+ASR_DECODE_WORKERS = int(os.getenv("ASR_DECODE_WORKERS", "2"))
+ASR_EMPTY_CACHE_ON_ERROR = os.getenv("ASR_EMPTY_CACHE_ON_ERROR", "0") == "1"
+ASR_CPU_THREADS = int(os.getenv("ASR_CPU_THREADS", str(min(8, os.cpu_count() or 1))))
 
 AUTH_FILE = os.getenv("AUTH_FILE", "auth_tokens.txt")
 ASR_API_TOKENS = os.getenv("ASR_API_TOKENS", os.getenv("API_TOKEN", ""))
@@ -70,7 +74,7 @@ log = logging.getLogger("api-audio2txt")
 # FastAPI
 # =============================================================================
 
-app = FastAPI(title="api-audio2txt", version="1.1.0")
+app = FastAPI(title="api-audio2txt", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,7 +90,7 @@ app.add_middleware(
 # =============================================================================
 
 try:
-    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    torch.set_num_threads(ASR_CPU_THREADS)
 except Exception:
     pass
 
@@ -175,22 +179,30 @@ pipe = pipeline(
     tokenizer=processor.tokenizer,
     feature_extractor=processor.feature_extractor,
     chunk_length_s=CHUNK,
+    stride_length_s=ASR_STRIDE,
     batch_size=BATCH,
     torch_dtype=DT,
     device=DEV,
 )
 
-asr_executor = ThreadPoolExecutor(max_workers=ASR_WORKERS)
+# The lock and the single worker are both intentional. wait_for() cannot stop a
+# CUDA kernel that is already executing; one worker prevents a timed-out request
+# from overlapping a subsequent request on the GPU.
+asr_executor = ThreadPoolExecutor(max_workers=1)
+decode_executor = ThreadPoolExecutor(max_workers=ASR_DECODE_WORKERS)
 asr_lock = asyncio.Lock()
 
 log.info(
-    "ASR ready: chunk=%ss batch=%s timeout=%ss max_new_tokens=%s num_beams=%s workers=%s",
+    "ASR ready: chunk=%ss stride=%ss batch=%s timeout=%ss max_new_tokens=%s "
+    "num_beams=%s decode_workers=%s cpu_threads=%s",
     CHUNK,
+    ASR_STRIDE,
     BATCH,
     ASR_TIMEOUT,
     ASR_MAX_NEW_TOKENS,
     ASR_NUM_BEAMS,
-    ASR_WORKERS,
+    ASR_DECODE_WORKERS,
+    ASR_CPU_THREADS,
 )
 
 
@@ -198,7 +210,7 @@ log.info(
 # Utils
 # =============================================================================
 
-def _timestamp_mode(raw: Optional[str]) -> Any:
+def _timestamp_mode(raw: Optional[str], response_format: str = "json") -> Any:
     """
     OpenAI envoie parfois:
       timestamp_granularities[]=word
@@ -212,7 +224,9 @@ def _timestamp_mode(raw: Optional[str]) -> Any:
     On évite "sentence", qui est douteux ici.
     """
     if not raw:
-        return True
+        # Timestamp decoding adds work and is unnecessary for the common JSON/text
+        # path. Subtitle and verbose responses still get segment timestamps.
+        return response_format in {"srt", "vtt", "verbose_json"}
 
     text = str(raw).strip()
 
@@ -297,7 +311,10 @@ def _to_vtt(segments: List[Dict[str, Any]]) -> str:
 
 
 def _safe_cuda_cleanup() -> None:
-    if CUDA:
+    # empty_cache() forces allocator churn and normally makes the next request
+    # slower. It remains available as an escape hatch for deployments that see
+    # CUDA OOM errors.
+    if CUDA and ASR_EMPTY_CACHE_ON_ERROR:
         try:
             torch.cuda.synchronize()
         except Exception:
@@ -338,6 +355,26 @@ def _load_audio_to_array(data: bytes) -> Tuple[Any, float]:
     array = wav.squeeze(0).contiguous().numpy()
 
     return array, duration
+
+
+async def _read_upload(file: UploadFile) -> bytes:
+    """Read incrementally so an oversized upload is rejected before it is copied."""
+    chunks: List[bytes] = []
+    size = 0
+
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if MAX_UPLOAD_BYTES and size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Audio file is too large")
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+async def _decode_audio(data: bytes) -> Tuple[Any, float]:
+    """Keep container decoding and resampling off Uvicorn's event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(decode_executor, _load_audio_to_array, data)
 
 
 def _run_asr_sync(
@@ -427,8 +464,11 @@ async def transcribe(
 ):
     _check_auth(authorization)
 
+    if response_format not in {"json", "verbose_json", "text", "srt", "vtt"}:
+        raise HTTPException(status_code=400, detail="Invalid response format specified")
+
     request_id = str(uuid.uuid4())[:8]
-    started = time.time()
+    started = time.perf_counter()
 
     log.info(
         "[%s] STT start filename=%s model=%s language=%s response_format=%s",
@@ -440,12 +480,12 @@ async def transcribe(
     )
 
     try:
-        data = await file.read()
+        data = await _read_upload(file)
 
         if not data:
             raise HTTPException(status_code=400, detail="Empty audio file")
 
-        array, duration = _load_audio_to_array(data)
+        array, duration = await _decode_audio(data)
 
         log.info(
             "[%s] audio loaded duration=%.2fs bytes=%d",
@@ -454,7 +494,7 @@ async def transcribe(
             len(data),
         )
 
-        timestamp_mode = _timestamp_mode(timestamp_granularities)
+        timestamp_mode = _timestamp_mode(timestamp_granularities, response_format)
 
         result = await _run_asr_async(
             array=array,
@@ -465,7 +505,7 @@ async def transcribe(
         text = result.get("text", "") or ""
         segments = _segments(result)
 
-        elapsed = time.time() - started
+        elapsed = time.perf_counter() - started
 
         log.info(
             "[%s] STT done elapsed=%.2fs duration=%.2fs text_chars=%d segments=%d",
@@ -477,7 +517,7 @@ async def transcribe(
         )
 
     except asyncio.TimeoutError:
-        elapsed = time.time() - started
+        elapsed = time.perf_counter() - started
         log.error("[%s] STT timeout after %.2fs", request_id, elapsed)
         _safe_cuda_cleanup()
         raise HTTPException(
@@ -489,7 +529,7 @@ async def transcribe(
         raise
 
     except Exception as exc:
-        elapsed = time.time() - started
+        elapsed = time.perf_counter() - started
         log.exception("[%s] STT error after %.2fs: %s", request_id, elapsed, exc)
         _safe_cuda_cleanup()
         raise HTTPException(
@@ -524,10 +564,8 @@ async def transcribe(
     if response_format == "vtt":
         return PlainTextResponse(_to_vtt(segments))
 
-    raise HTTPException(
-        status_code=400,
-        detail="Invalid response format specified",
-    )
+    # response_format is validated before decoding/inference.
+    raise AssertionError("unreachable response format")
 
 
 # =============================================================================
