@@ -24,8 +24,14 @@ Important settings:
 - `ASR_API_TOKENS`: comma-separated bearer tokens for API access.
 - `ASR_MODEL`: Hugging Face model id. Defaults to `openai/whisper-large-v3-turbo`.
 - `HOST` / `PORT`: default bind address used when `run.sh` arguments are omitted.
-- `ASR_BATCH`: the most useful GPU throughput knob. Increase it gradually while
-  watching VRAM; `1` generally gives the best single-request latency.
+- `ASR_BATCH`: the number of audio chunks evaluated together by the Transformers
+  pipeline. The default is `4`; reduce it if VRAM is limited.
+- `ASR_REQUEST_BATCH`: maximum number of compatible concurrent HTTP requests
+  combined into one GPU pipeline call. The default is `4`.
+- `ASR_BATCH_WAIT_MS`: maximum micro-batching window (default `15` ms). This tiny
+  latency cost lets requests arriving together share a GPU batch.
+- `ASR_QUEUE_SIZE`: maximum pending work. Once full, the API returns `429` with a
+  `Retry-After` header instead of accumulating requests that will time out.
 - `ASR_CHUNK_S` / `ASR_STRIDE_S`: chunk size and overlap. The 30 s / 5 s defaults
   preserve words around chunk boundaries; reducing the stride can save work but
   can also reduce transcription quality.
@@ -49,19 +55,27 @@ seconds`), peak VRAM, and word error rate (WER) against a fixed reference set.
 Recommended order:
 
 1. Keep `ASR_NUM_BEAMS=1`; beam search usually adds substantial latency.
-2. Increase `ASR_BATCH` for throughput when several chunks or requests are
-   available and VRAM permits. Re-test tail latency after each change.
+2. Tune `ASR_REQUEST_BATCH` and `ASR_BATCH` together (`2`, `4`, then `8`) while
+   watching VRAM. Re-test both throughput and tail latency after each change.
 3. Keep the default 5 s stride for quality. Only lower it after a WER comparison.
 4. Supply `language` when it is known to avoid language-detection work and reduce
    the chance of selecting the wrong language.
 5. Leave `ASR_EMPTY_CACHE_ON_ERROR=0`. Emptying the CUDA allocator cache on every
    error causes allocator churn and slows the next request.
 
-Inference remains serialized in one process. This avoids CUDA contention and,
-critically, prevents a kernel from a timed-out request from overlapping the next
-request (Python cancellation cannot stop an already-running CUDA kernel). Scale
-throughput with one process per GPU rather than multiple Uvicorn workers sharing
-one GPU.
+One scheduler owns inference in each process, but it dynamically batches compatible
+concurrent requests (same language and timestamp mode). This avoids CUDA contention
+and model duplication while using GPU parallelism instead of processing every HTTP
+request serially. A request that times out while queued is discarded before
+inference. Use one application process per GPU; do not use multiple Uvicorn workers
+on the same device. Scale beyond the capacity of one tuned batch worker with one
+replica per GPU and put a bounded load-balancing queue in front of the replicas.
+
+For overload handling, clients should retry only `429` and transient `5xx`
+responses, honor `Retry-After`, use exponential backoff with jitter, and impose a
+retry limit. They should not blindly retry validation errors. Set the client timeout
+above the measured P95 plus queue allowance, but keep `ASR_QUEUE_SIZE` low enough
+that accepted requests can normally finish inside that timeout.
 
 ### OSS alternatives reviewed
 
