@@ -53,9 +53,10 @@ PORT = int(os.getenv("PORT", "8000"))
 
 SR = int(os.getenv("ASR_SR", "16000"))
 CHUNK = int(os.getenv("ASR_CHUNK_S", "30"))
-BATCH = int(os.getenv("ASR_BATCH", "1"))
+BATCH = max(1, int(os.getenv("ASR_BATCH", "4")))
 
 MAX_SEC = int(os.getenv("ASR_MAX_SEC", "5400"))  # 90 min max
+MAX_UPLOAD_BYTES = int(os.getenv("ASR_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 ASR_TIMEOUT = int(os.getenv("ASR_TIMEOUT", "180"))
 
 # Per-chunk decode safety valve. Whisper-large-v3-turbo emits ~3-4 decoder tokens
@@ -173,9 +174,11 @@ def _load_tokens(path: str = AUTH_FILE) -> set:
 
 
 @app.on_event("startup")
-def _startup() -> None:
-    global AUTH_TOKENS
+async def _startup() -> None:
+    global AUTH_TOKENS, asr_queue, asr_batch_task
     AUTH_TOKENS = _load_tokens()
+    asr_queue = asyncio.Queue(maxsize=ASR_QUEUE_SIZE)
+    asr_batch_task = asyncio.create_task(_asr_batch_loop())
     log.info("Loaded %d auth token(s)", len(AUTH_TOKENS))
 
     # Warm up so the first real request does not pay cudnn autotune + lazy alloc.
@@ -185,6 +188,18 @@ def _startup() -> None:
             log.info("Warmup inference done")
         except Exception as exc:  # pragma: no cover
             log.warning("Warmup failed (non-fatal): %s", exc)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if asr_batch_task is not None:
+        asr_batch_task.cancel()
+        try:
+            await asr_batch_task
+        except asyncio.CancelledError:
+            pass
+    asr_executor.shutdown(wait=False, cancel_futures=True)
+    decode_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _check_auth(authorization: Optional[str]) -> None:
@@ -233,6 +248,7 @@ pipe = pipeline(
     tokenizer=processor.tokenizer,
     feature_extractor=processor.feature_extractor,
     chunk_length_s=CHUNK,
+    stride_length_s=ASR_STRIDE,
     batch_size=BATCH,
     torch_dtype=DT,
     device=DEV,
@@ -247,6 +263,7 @@ _inflight = 0
 log.info(
     "ASR ready: chunk=%ss batch=%s timeout=%ss max_new_tokens=%s num_beams=%s workers=%s vad=%s",
     CHUNK,
+    ASR_STRIDE,
     BATCH,
     ASR_TIMEOUT,
     ASR_MAX_NEW_TOKENS,
@@ -464,7 +481,9 @@ def _timestamp_mode(raw: Optional[str]) -> Any:
     Transformers expects return_timestamps=True or "word".
     """
     if not raw:
-        return True
+        # Timestamp decoding adds work and is unnecessary for the common JSON/text
+        # path. Subtitle and verbose responses still get segment timestamps.
+        return response_format in {"srt", "vtt", "verbose_json"}
 
     text = str(raw).strip()
 
@@ -678,10 +697,66 @@ def _run_asr_sync(
     with asr_sem, torch.inference_mode():
         result = pipe(input_payload, **generate_kwargs)
 
-    if not isinstance(result, dict):
-        raise RuntimeError(f"Unexpected ASR result type: {type(result)}")
+    if not isinstance(results, list) or len(results) != len(arrays):
+        raise RuntimeError(
+            f"Unexpected ASR batch result: {type(results)} "
+            f"({len(results) if isinstance(results, list) else 'n/a'} results)"
+        )
+    if not all(isinstance(result, dict) for result in results):
+        raise RuntimeError("ASR batch contains a non-dictionary result")
 
-    return result
+    return results
+
+
+async def _asr_batch_loop() -> None:
+    """Collect a short burst of requests and infer compatible jobs together."""
+    assert asr_queue is not None
+    loop = asyncio.get_running_loop()
+
+    while True:
+        first = await asr_queue.get()
+        jobs = [first]
+
+        if ASR_BATCH_WAIT_MS > 0:
+            await asyncio.sleep(ASR_BATCH_WAIT_MS / 1000.0)
+
+        while len(jobs) < ASR_REQUEST_BATCH:
+            try:
+                jobs.append(asr_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        # A single pipeline invocation must share generation options. Split a
+        # micro-batch only when clients request different languages/timestamps.
+        groups: Dict[Tuple[Optional[str], Any], List[Any]] = {}
+        for job in jobs:
+            _array, language, timestamp_mode, future = job
+            if not future.cancelled():
+                groups.setdefault((language, timestamp_mode), []).append(job)
+
+        try:
+            for (language, timestamp_mode), group in groups.items():
+                arrays = [job[0] for job in group]
+                try:
+                    results = await loop.run_in_executor(
+                        asr_executor,
+                        _run_asr_batch_sync,
+                        arrays,
+                        language,
+                        timestamp_mode,
+                    )
+                except Exception as exc:
+                    for *_unused, future in group:
+                        if not future.done():
+                            future.set_exception(exc)
+                else:
+                    for job, result in zip(group, results):
+                        future = job[3]
+                        if not future.done():
+                            future.set_result(result)
+        finally:
+            for _job in jobs:
+                asr_queue.task_done()
 
 
 async def _run_asr_async(
@@ -690,7 +765,12 @@ async def _run_asr_async(
     timestamp_mode: Any,
     duration: float = 0.0,
 ) -> Dict[str, Any]:
+    global asr_queue, asr_batch_task
     loop = asyncio.get_running_loop()
+    if asr_queue is None:
+        # Supports direct invocation in tests and non-ASGI embedding.
+        asr_queue = asyncio.Queue(maxsize=ASR_QUEUE_SIZE)
+        asr_batch_task = asyncio.create_task(_asr_batch_loop())
 
     return await asyncio.wait_for(
         loop.run_in_executor(
@@ -698,6 +778,12 @@ async def _run_asr_async(
         ),
         timeout=ASR_TIMEOUT,
     )
+
+    try:
+        return await asyncio.wait_for(future, timeout=ASR_TIMEOUT)
+    except asyncio.TimeoutError:
+        future.cancel()
+        raise
 
 
 # =============================================================================
@@ -747,8 +833,11 @@ async def transcribe(
 
     _check_auth(authorization)
 
+    if response_format not in {"json", "verbose_json", "text", "srt", "vtt"}:
+        raise HTTPException(status_code=400, detail="Invalid response format specified")
+
     request_id = str(uuid.uuid4())[:8]
-    started = time.time()
+    started = time.perf_counter()
 
     with _queue_lock:
         if _inflight >= ASR_MAX_QUEUE:
@@ -828,7 +917,7 @@ async def transcribe(
         )
 
     except asyncio.TimeoutError:
-        elapsed = time.time() - started
+        elapsed = time.perf_counter() - started
         log.error("[%s] STT timeout after %.2fs", request_id, elapsed)
         _cuda_cleanup()
         raise HTTPException(
@@ -839,7 +928,7 @@ async def transcribe(
         raise
 
     except Exception as exc:
-        elapsed = time.time() - started
+        elapsed = time.perf_counter() - started
         log.exception("[%s] STT error after %.2fs: %s", request_id, elapsed, exc)
         _cuda_cleanup()
         raise HTTPException(status_code=500, detail=f"ASR pipeline error: {exc}") from exc
